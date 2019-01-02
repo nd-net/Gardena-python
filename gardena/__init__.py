@@ -1,1 +1,1 @@
-from .gardena import Hub
+from .gardena import *
