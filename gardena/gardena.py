@@ -1,58 +1,104 @@
 import logging
 import requests
+from urllib.parse import urljoin
 
 _LOGGER = logging.getLogger(__name__)
 
-def as_type(type, object):
-    if isinstance(object, type):
-        return object
-    return type(**object)
-
-def as_listof(type, value):
-    return [as_type(Property, v) for v in value or []]
-
-def lenient(type_converter=None):
+class JsonObject:
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
     
-    def matching_type(value, key):
-        converter = type_converter.get(key, None) if type_converter else None
-        if not converter:
-            return value
-        return converter(value)
+    def __repr__(self):
+        items = ("{}={!r}".format(k, v) for k, v in self.__dict__.items())
+        return "{}({})".format(self.__class__.__name__, ", ".join(items))
     
-    def decorator(func):
-        import inspect
-        from functools import wraps
-        sig = inspect.signature(func)
-        keys = [param.name for param in sig.parameters.values() if param.kind == param.POSITIONAL_OR_KEYWORD]
+    @classmethod
+    def wrap(cls, val):
+        if isinstance(val, cls):
+            return val
+        if isinstance(val, dict):
+            return cls(**val)
+        return cls(**val.__dict__)
     
-        @wraps(func)
-        def lenient_function(*args, **kw):
-            a = [matching_type(value, name) for name, value in zip(keys, args)]
-            filtered = { key: matching_type(kw.get(key, None), key) for key in keys[len(args):] }
-            return func(*args, **filtered)
+    @classmethod
+    def wrap_list(cls, val):
+        return [cls.wrap(i) for i in val]
+
+class Session(JsonObject):
+    token = None
+    user_id = None
+    refresh_token = None
+
+class Location(JsonObject):
+    id = None
+    name = None
+    devices = None
+
+class Property(JsonObject):
+    id = None
+    name = None
+    value = None
+    unit = None
+    timestamp = None
+    writeable = None
+    supported_values = None
+
+class Location(JsonObject):
+    id = None
+    name = None
+    devices= None
+
+class Property(JsonObject):
+    id = None
+    name = None
+    value = None
+    unit = None
+    timestamp = None
+    writeable = None
+    supported_values = None
+
+class Ability(JsonObject):
+    id = None
+    name = None
+    type = None
+    _properties = {}
     
-        return lenient_function
-    return decorator
+    @property
+    def properties(self):
+        return self._properties
+    @properties.setter
+    def properties(self, value):
+        self._properties = Property.wrap_list(value)
 
-def defaults_namedtuple(name, fields, type_converter=None):
-    from collections import namedtuple
+class Device(JsonObject):
+    id = None
+    name = None
+    description = None
+    category = None
+    device_state = None
+    _abilities = None
+    
+    @property
+    def abilities(self):
+        return self._abilities
+    @abilities.setter
+    def abilities(self, value):
+        self._abilities = Ability.wrap_list(value)
 
-    result = namedtuple(name, fields)
-    result.__new__ = lenient(type_converter)(result.__new__)
-    return result
-
-Session = defaults_namedtuple("Session", "token user_id refresh_token")
-Location = defaults_namedtuple("Location", "id name devices")
-Property = defaults_namedtuple("Property", "id name value unit timestamp writeable supported_values")
-Ability = defaults_namedtuple("Ability", "id name type properties", {
-    "properties": lambda value: as_listof(Property, value)
-})
-Device = defaults_namedtuple("Device", "id name description category device_state, abilities", {
-    "abilities": lambda value: as_listof(Ability, value)
-})
+class BaseURLSession(requests.Session):
+    
+    base_url = None
+    
+    def __init__(self, base_url=None, *args, **kw):
+        super().__init__(*args, **kw)
+        self.base_url = base_url
+    
+    def request(self, method, url, *args, **kw):
+        return super().request(method, urljoin(self.base_url, url), *args, **kw)
 
 class Hub:
-    BASE_URL = "https://smart.gardena.com/sg-1"
+    base_url = "https://smart.gardena.com/sg-1/"
 
     session = Session()
     requestSession = None
@@ -60,52 +106,39 @@ class Hub:
     def __init__(self, username, password):
         self.username = username
         self.password = password
-        self.requestSession = requests.Session()
-    
-    def execute(self, path, params=None, data=None, method=None):
-        headers = {
-            "Accept": "application/json",
-        }
-        
-        if not method:
-            method = "get" if data is None else "post"
-        response = self.requestSession.request(
-            method,
-            url=self.BASE_URL + path,
-            params=params,
-            headers=headers,
-            json=data,
-            allow_redirects=True,
-        )
-        print(response.content)
-        return response
+        self.requestSession = BaseURLSession(self.base_url)
     
     def login(self):
         _LOGGER.info("Logging in with user name %s", self.username)
-        self.requestSession = requests.Session()
+        self.requestSession = BaseURLSession(self.base_url)
+        self.requestSession.headers["Accept"] = "application/json"
         data = {
             "sessions": {
                 "email": self.username,
                 "password": self.password,
             }
         }
-        response = self.execute("/sessions", data=data)
+        response = self.requestSession.post("sessions", json=data)
         json = response.json()
         self.session = Session(**json.get("sessions", {}))
-        _LOGGER.info("Got a session %s", self.session)
+        _LOGGER.debug("Got a session %s", self.session)
         self.requestSession.headers["X-Session"] = self.session.token
     
     def retrieve_locations(self):
         _LOGGER.info("Retrieving locations for user id %s", self.session.user_id)
-        response = self.execute("/locations", {"user_id": self.session.user_id})
+        response = self.requestSession.get("locations", params={
+            "user_id": self.session.user_id
+        })
         data = response.json()
-        _LOGGER.info("Got locations %s", data)
-        return [as_type(Location, location) for location in data.get("locations", [])]
+        _LOGGER.debug("Got locations %s", data)
+        return Location.wrap_list(data.get("locations", []))
     
     def retrieve_devices(self, location):
         _LOGGER.info("Retrieving devices for location id %s", location.id)
-        response = self.execute("/devices", {"locationId": location.id})
+        response = self.requestSession.get("devices", params={
+            "locationId": location.id
+        })
         data = response.json()
-        _LOGGER.info("Got devices %s", data)
-        return [as_type(Device, location) for location in data.get("devices", [])]
-        
+        _LOGGER.debug("Got devices %s", data)
+        return Device.wrap_list(data.get("devices", []))
+    
